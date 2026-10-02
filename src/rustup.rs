@@ -1,15 +1,15 @@
 use crate::download::{
-    append_to_path, copy_file_create_dir_with_sha256, download, download_string,
-    download_with_sha256_file, move_if_exists, move_if_exists_with_sha256, write_file_create_dir,
-    DownloadError,
+    DownloadError, append_to_path, copy_file_create_dir_with_sha256, download, download_string,
+    download_with_sha256_file, http_client, move_if_exists, move_if_exists_with_sha256,
+    write_file_create_dir,
 };
 use crate::mirror::{ConfigMirror, ConfigRustup, MirrorError};
 use crate::progress_bar::{current_step_prefix, padded_prefix_message};
 use console::style;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
-use reqwest::header::HeaderValue;
 use reqwest::Client;
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,6 @@ use tokio::task::JoinError;
 
 /// Windows platforms (platforms where rustup-init has a .exe extension)
 static PLATFORMS_WINDOWS: &[&str] = &[
-    "i586-pc-windows-msvc",
     "i686-pc-windows-gnu",
     "i686-pc-windows-msvc",
     "x86_64-pc-windows-gnu",
@@ -195,7 +194,7 @@ pub async fn sync_one_init(
     };
 
     download_with_sha256_file(client, &source_url, &local_path, retries, false, user_agent).await?;
-    copy_file_create_dir_with_sha256(&local_path, &archive_path)?;
+    copy_file_create_dir_with_sha256(&local_path, &archive_path).await?;
 
     Ok(())
 }
@@ -226,7 +225,7 @@ async fn create_sync_tasks(
     threads: usize,
     pb: &ProgressBar,
 ) -> Vec<Result<Result<(), DownloadError>, JoinError>> {
-    let client = Client::new();
+    let client = http_client();
     futures_util::stream::iter(platforms.iter())
         .map(|platform| {
             let client = client.clone();
@@ -272,7 +271,7 @@ pub async fn sync_rustup_init(
 ) -> Result<(), SyncError> {
     let mut errors_occurred = 0usize;
 
-    let client = Client::new();
+    let client = http_client();
 
     // Download rustup release file
     let release_url = format!("{source}/rustup/release-stable.toml");
@@ -292,7 +291,7 @@ pub async fn sync_rustup_init(
 
     let rustup_version = get_rustup_version(&release_part_path)?;
 
-    move_if_exists(&release_part_path, &release_path)?;
+    move_if_exists(&release_part_path, &release_path).await?;
 
     let pb = panamax_progress_bar(platforms.len(), prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
@@ -324,8 +323,13 @@ pub async fn sync_rustup_init(
     .await;
 
     for res in unix_tasks.into_iter().chain(win_tasks) {
-        // Unwrap the join result.
-        let res = res.unwrap();
+        // A JoinError means the task panicked; count it as a failure rather
+        // than taking down the whole sync.
+        let Ok(res) = res else {
+            errors_occurred += 1;
+            eprintln!("Download task failed unexpectedly");
+            continue;
+        };
 
         if let Err(e) = res {
             match e {
@@ -541,7 +545,7 @@ pub fn get_channel_history(path: &Path, channel: &str) -> Result<ChannelHistoryF
     Ok(toml::from_str(&ch_data)?)
 }
 
-pub fn add_to_channel_history(
+pub async fn add_to_channel_history(
     path: &Path,
     channel: &str,
     date: &str,
@@ -566,7 +570,7 @@ pub fn add_to_channel_history(
     let ch_data = toml::to_string(&channel_history)?;
 
     let channel_history_path = path.join(format!("mirror-{channel}-history.toml"));
-    write_file_create_dir(&channel_history_path, &ch_data)?;
+    write_file_create_dir(&channel_history_path, &ch_data).await?;
 
     Ok(())
 }
@@ -607,7 +611,7 @@ pub async fn sync_rustup_channel(
             (url, path, Vec::new())
         };
     let channel_part_path = append_to_path(&channel_path, ".part");
-    let client = Client::new();
+    let client = http_client();
     download_with_sha256_file(
         &client,
         &channel_url,
@@ -626,7 +630,7 @@ pub async fn sync_rustup_channel(
         download_xz,
         platforms,
     )?;
-    move_if_exists_with_sha256(&channel_part_path, &channel_path)?;
+    move_if_exists_with_sha256(&channel_part_path, &channel_path).await?;
 
     let pb = panamax_progress_bar(files.len(), prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
@@ -666,8 +670,13 @@ pub async fn sync_rustup_channel(
         .await;
 
     for res in tasks {
-        // Unwrap the join result.
-        let res = res.unwrap();
+        // A JoinError means the task panicked; count it as a failure rather
+        // than taking down the whole sync.
+        let Ok(res) = res else {
+            errors_occurred += 1;
+            eprintln!("Download task failed unexpectedly");
+            continue;
+        };
 
         if let Err(e) = res {
             match e {
@@ -682,7 +691,7 @@ pub async fn sync_rustup_channel(
 
     if errors_occurred == 0 {
         // Write channel history file
-        add_to_channel_history(path, channel, &date, &files, &extra_files)?;
+        add_to_channel_history(path, channel, &date, &files, &extra_files).await?;
         Ok(())
     } else {
         Err(SyncError::FailedDownloads {
@@ -896,4 +905,28 @@ pub async fn sync(
     eprintln!("{}", style("Syncing Rustup repositories complete!").bold());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PLATFORMS_WINDOWS;
+
+    #[test]
+    fn windows_platform_allowlist_is_valid() {
+        // No duplicates (the original i586/i686 typo regression).
+        let mut seen = std::collections::HashSet::new();
+        for platform in PLATFORMS_WINDOWS {
+            assert!(seen.insert(*platform), "duplicate platform: {platform}");
+        }
+        // Every entry must be a real Rust target for Windows.
+        for platform in PLATFORMS_WINDOWS {
+            assert!(
+                platform.ends_with("-pc-windows-msvc") || platform.ends_with("-pc-windows-gnu"),
+                "not a windows target: {platform}"
+            );
+        }
+        // The i686 pair must be present.
+        assert!(PLATFORMS_WINDOWS.contains(&"i686-pc-windows-msvc"));
+        assert!(PLATFORMS_WINDOWS.contains(&"i686-pc-windows-gnu"));
+    }
 }

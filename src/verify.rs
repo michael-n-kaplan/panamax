@@ -13,15 +13,14 @@ use futures_util::StreamExt;
 use git2::Repository;
 use http::header::HeaderValue;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
-use reqwest::Client;
 
 use crate::{
     crates::{
-        cargo_lock_to_mirror_entries, get_crate_path, sync_one_crate_entry,
-        vendor_path_to_mirror_entries, CrateEntry,
+        CrateEntry, cargo_lock_to_mirror_entries, get_crate_path, sync_one_crate_entry,
+        vendor_path_to_mirror_entries,
     },
-    download::DownloadError,
-    mirror::{default_user_agent, ConfigCrates, ConfigMirror, MirrorError},
+    download::{DownloadError, http_client},
+    mirror::{ConfigCrates, ConfigMirror, MirrorError, default_user_agent},
     progress_bar::padded_prefix_message,
 };
 
@@ -180,17 +179,23 @@ pub(crate) async fn verify_mirror(
     let diff = repo.diff_tree_to_tree(None, Some(&master_tree), None)?;
 
     let mut missing_crates = Vec::new();
+    // Per-entry problems (unencodable paths, missing blobs, bad lines) are
+    // collected and reported after the scan instead of panicking mid-diff.
+    let mut entry_problems = Vec::new();
 
     let is_crate_whitelist_only = vendor_path.is_some() || cargo_lock_filepath.is_some();
     // if a vendor_path, parse the filepath for Cargo.toml files for each crate, filling vendors
     let mut mirror_entries = vec![];
-    vendor_path_to_mirror_entries(&mut mirror_entries, vendor_path.as_ref());
-    cargo_lock_to_mirror_entries(&mut mirror_entries, cargo_lock_filepath.as_ref());
+    mirror_entries.extend(vendor_path_to_mirror_entries(vendor_path.as_ref())?);
+    mirror_entries.extend(cargo_lock_to_mirror_entries(cargo_lock_filepath.as_ref())?);
 
     diff.foreach(
         &mut |delta, _| {
             let df = delta.new_file();
-            let p = df.path().unwrap();
+            let Some(p) = df.path() else {
+                entry_problems.push("index entry with non-UTF-8 path".to_string());
+                return true;
+            };
             if p == Path::new("config.json") {
                 return true;
             }
@@ -202,12 +207,17 @@ pub(crate) async fn verify_mirror(
             if oid.is_zero() {
                 return true;
             }
-            let blob = repo.find_blob(oid).unwrap();
+            let Ok(blob) = repo.find_blob(oid) else {
+                entry_problems.push(format!("missing blob {oid} for {}", p.display()));
+                return true;
+            };
             let data = blob.content();
 
             // Iterating over each line of a JSON file from local crates.io repository
             for line in Cursor::new(data).lines() {
-                let line = line.unwrap();
+                let Ok(line) = line else {
+                    continue;
+                };
                 let crate_entry: CrateEntry = match serde_json::from_str(&line) {
                     Ok(c) => c,
                     Err(_) => {
@@ -226,8 +236,16 @@ pub(crate) async fn verify_mirror(
                 }
 
                 // Building crates local path.
-                let file_path =
-                    get_crate_path(&path, crate_entry.get_name(), crate_entry.get_vers()).unwrap();
+                let Some(file_path) =
+                    get_crate_path(&path, crate_entry.get_name(), crate_entry.get_vers())
+                else {
+                    entry_problems.push(format!(
+                        "invalid crate name/version: {}/{}",
+                        crate_entry.get_name(),
+                        crate_entry.get_vers()
+                    ));
+                    continue;
+                };
 
                 // Checking if crate is missing.
                 if !CRATES_403
@@ -245,6 +263,21 @@ pub(crate) async fn verify_mirror(
         None,
         None,
     )?;
+
+    if !entry_problems.is_empty() {
+        eprintln!(
+            "warning: skipped {} index entr{} during verification:",
+            entry_problems.len(),
+            if entry_problems.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        for problem in &entry_problems {
+            eprintln!("  {problem}");
+        }
+    }
 
     pb.finish();
     *current_step += 1;
@@ -283,8 +316,12 @@ pub(crate) async fn handle_user_input(
         _ => {
             // Popping '\n'
             input.pop();
-            // Safe to unwrap here
-            let input = input.parse::<Input>().unwrap();
+            // `Input::from_str` cannot fail (`Err = Infallible`); the never
+            // pattern documents that instead of an unwrap.
+            let input = match input.parse::<Input>() {
+                Ok(input) => input,
+                Err(never) => match never {},
+            };
             if input.check(missing_crates.len()) {
                 // Input is not respecting `Vec` bounds, ignoring request
                 Ok(Vec::new())
@@ -365,7 +402,7 @@ pub(crate) async fn fix_mirror(
         }
     };
 
-    let client = Client::new();
+    let client = http_client();
 
     // This code is copied from `crates::sync_crates_files` and could be mutualised in a future commit.
     // For example in a function within module crates (e.g. `crates::build_and_run_tasks`)
@@ -400,7 +437,12 @@ pub(crate) async fn fix_mirror(
         .await;
 
     for t in tasks {
-        let res = t.unwrap();
+        // A JoinError means the download task panicked; report it and move on
+        // rather than taking down the whole sync.
+        let Ok(res) = t else {
+            eprintln!("Download task failed unexpectedly");
+            continue;
+        };
         match res {
             Ok(())
             | Err(DownloadError::NotFound {

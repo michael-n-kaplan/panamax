@@ -105,6 +105,14 @@ If you would prefer having these instructions elsewhere, the rest of this README
 
 Additionally, if you would prefer hosting a server with nginx, there is a sample nginx configuration in the repository, at `nginx.sample.conf`.
 
+### Security
+
+The served crates.io index is a **git repository**, and panamax exposes `git http-backend` so that clients can `git clone`/`git ls-remote` it. That same endpoint also accepts **`git push` with no authentication**: anyone who can reach the server can modify the local index repository.
+
+- On a **trusted internal network** this is usually acceptable, and panamax prints a warning at startup when serving over plain HTTP.
+- If the mirror is **internet-facing**, serve the index over TLS (`--cert-path`/`--key-path`). Clients only need **read** access to the git endpoint (`git clone`/`fetch`); push is not required for normal use, but `git http-backend` cannot distinguish the two, so restrict the endpoint (reverse proxy with auth, firewall rules) if untrusted clients may reach it.
+- Plain HTTP (`http://`) exposes both downloads and the unauthenticated push endpoint to the network; prefer TLS for any non-local deployment.
+
 ## Configuring `rustup` and `cargo`
 
 Once you have a mirror server set up and running, it's time to tell your Rust components to use it.

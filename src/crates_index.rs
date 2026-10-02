@@ -3,8 +3,8 @@ use serde::Serialize;
 use std::{io, num::TryFromIntError, path::Path, time::Duration};
 
 use git2::{
-    build::{CheckoutBuilder, RepoBuilder},
     FetchOptions, RemoteCallbacks, Repository, Signature,
+    build::{CheckoutBuilder, RepoBuilder},
 };
 use thiserror::Error;
 

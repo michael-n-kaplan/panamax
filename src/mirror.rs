@@ -129,26 +129,6 @@ pub fn load_mirror_toml(path: &Path) -> Result<Config, MirrorError> {
     )?)?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_config_round_trips() {
-        let config: Config = toml::from_str(&render_mirror_config(false)).unwrap();
-        assert!(config.rustup.as_ref().unwrap().sync);
-        assert!(config.crates.as_ref().unwrap().sync);
-    }
-
-    #[test]
-    fn ignore_rustup_disables_rustup_sync_only() {
-        let config: Config = toml::from_str(&render_mirror_config(true)).unwrap();
-        assert!(!config.rustup.as_ref().unwrap().sync);
-        // crates mirroring stays enabled
-        assert!(config.crates.as_ref().unwrap().sync);
-    }
-}
-
 pub fn init(path: &Path, ignore_rustup: bool) -> Result<(), MirrorError> {
     create_mirror_directories(path, ignore_rustup)?;
     if create_mirror_toml(path, ignore_rustup)? {
@@ -187,13 +167,14 @@ pub async fn sync(
     // Fail if use_new_crates_format is not true, and old format is detected.
     // If use_new_crates_format is true and new format is detected, warn the user.
     // If use_new_crates_format is true, ignore the format and assume it's new.
-    if let Some(crates) = &mirror.crates {
-        if crates.sync && !is_new_crates_format(&path.join("crates"))? {
-            eprintln!("Your crates directory is using the old 0.2 format, however");
-            eprintln!("Panamax 0.3+ has deprecated this format for a new one.");
-            eprintln!("Please delete crates/ from your mirror directory to continue.");
-            return Ok(());
-        }
+    if let Some(crates) = &mirror.crates
+        && crates.sync
+        && !is_new_crates_format(&path.join("crates"))?
+    {
+        eprintln!("Your crates directory is using the old 0.2 format, however");
+        eprintln!("Panamax 0.3+ has deprecated this format for a new one.");
+        eprintln!("Please delete crates/ from your mirror directory to continue.");
+        return Ok(());
     }
 
     // Handle the contact information
@@ -353,12 +334,12 @@ pub async fn serve(
         (Some(_), None) => {
             return Err(MirrorError::CmdLine(
                 "cert_path set but key_path not set.".to_string(),
-            ))
+            ));
         }
         (None, Some(_)) => {
             return Err(MirrorError::CmdLine(
                 "key_path set but cert_path not set.".to_string(),
-            ))
+            ));
         }
     };
 
@@ -399,13 +380,14 @@ pub(crate) async fn verify(
     // Fail if use_new_crates_format is not true, and old format is detected.
     // If use_new_crates_format is true and new format is detected, warn the user.
     // If use_new_crates_format is true, ignore the format and assume it's new.
-    if let Some(config) = &config.crates {
-        if config.sync && !is_new_crates_format(&path.join("crates"))? {
-            eprintln!("Your crates directory is using the old 0.2 format, however");
-            eprintln!("Panamax 0.3+ has deprecated this format for a new one.");
-            eprintln!("Please delete crates/ from your mirror directory to continue.");
-            return Ok(());
-        }
+    if let Some(config) = &config.crates
+        && config.sync
+        && !is_new_crates_format(&path.join("crates"))?
+    {
+        eprintln!("Your crates directory is using the old 0.2 format, however");
+        eprintln!("Panamax 0.3+ has deprecated this format for a new one.");
+        eprintln!("Please delete crates/ from your mirror directory to continue.");
+        return Ok(());
     }
 
     eprintln!("{}", style("Verifying mirror state...").bold());
@@ -437,10 +419,20 @@ pub(crate) async fn verify(
             return Ok(());
         }
 
-        // Safe to unwrap here
-        let crates_config = crates_config.unwrap();
+        // `sync` is true here, which requires the crates config to be present;
+        // treat the (impossible) missing case as a config error instead of panicking.
+        let Some(crates_config) = crates_config else {
+            return Err(MirrorError::Config(
+                "crates config is missing while crates sync is enabled".to_string(),
+            ));
+        };
 
-        debug_assert_ne!(steps, current_step);
+        // Verification (step 1) is done and we're on the download step;
+        // the step counter is 1-based and must not have passed the last step.
+        debug_assert!(
+            current_step <= steps,
+            "current step {current_step} passed the last step {steps}"
+        );
 
         // Ask users to choose whether to filter missing crates to download or not
         if !assume_yes {
@@ -462,4 +454,24 @@ pub(crate) async fn verify(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_round_trips() {
+        let config: Config = toml::from_str(&render_mirror_config(false)).unwrap();
+        assert!(config.rustup.as_ref().unwrap().sync);
+        assert!(config.crates.as_ref().unwrap().sync);
+    }
+
+    #[test]
+    fn ignore_rustup_disables_rustup_sync_only() {
+        let config: Config = toml::from_str(&render_mirror_config(true)).unwrap();
+        assert!(!config.rustup.as_ref().unwrap().sync);
+        // crates mirroring stays enabled
+        assert!(config.crates.as_ref().unwrap().sync);
+    }
 }

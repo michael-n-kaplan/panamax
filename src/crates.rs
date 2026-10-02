@@ -1,12 +1,12 @@
-use crate::crates_index::{fast_forward, IndexSyncError};
-use crate::download::{download, DownloadError};
+use crate::crates_index::{IndexSyncError, fast_forward};
+use crate::download::{DownloadError, download, http_client};
 use crate::mirror::{ConfigCrates, ConfigMirror};
 use crate::progress_bar::padded_prefix_message;
 use futures_util::StreamExt;
 use git2::Repository;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
-use reqwest::header::HeaderValue;
 use reqwest::Client;
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::read_dir;
@@ -34,6 +34,9 @@ pub enum SyncError {
 
     #[error("Index syncing error: {0}")]
     IndexSync(#[from] IndexSyncError),
+
+    #[error("{0}")]
+    Mirror(#[from] crate::mirror::MirrorError),
 }
 /// One entry found in a crates.io-index file.
 /// These files are formatted as lines of JSON.
@@ -108,9 +111,9 @@ pub async fn sync_crates_files(
 
     // if a vendor_path, parse the filepath for Cargo.toml files for each crate, filling vendors
     let mut mirror_entries = vec![];
-    vendor_path_to_mirror_entries(&mut mirror_entries, vendor_path.as_ref());
+    mirror_entries.extend(vendor_path_to_mirror_entries(vendor_path.as_ref())?);
     // gather crates from Cargo.lock if supplied
-    cargo_lock_to_mirror_entries(&mut mirror_entries, cargo_lock_filepath.as_ref());
+    mirror_entries.extend(cargo_lock_to_mirror_entries(cargo_lock_filepath.as_ref())?);
 
     let prefix = padded_prefix_message(2, 3, "Syncing crates files");
 
@@ -150,10 +153,16 @@ pub async fn sync_crates_files(
     pb.enable_steady_tick(Duration::from_millis(10));
 
     // Figure out which crates we need to update/remove.
+    // Per-entry problems (unencodable paths, missing blobs, bad lines) are
+    // collected and reported after the scan instead of panicking mid-diff.
+    let mut entry_problems = Vec::new();
     diff.foreach(
         &mut |delta, _| {
             let df = delta.new_file();
-            let p = df.path().unwrap();
+            let Some(p) = df.path() else {
+                entry_problems.push("index entry with non-UTF-8 path".to_string());
+                return true;
+            };
             if p == Path::new("config.json") {
                 return true;
             }
@@ -184,12 +193,17 @@ pub async fn sync_crates_files(
                 removed_crates.push(p.to_path_buf());
                 return true;
             }
-            let blob = repo.find_blob(oid).unwrap();
+            let Ok(blob) = repo.find_blob(oid) else {
+                entry_problems.push(format!("missing blob {oid} for {}", p.display()));
+                return true;
+            };
             let data = blob.content();
 
             // Download one crate for each of the versions in the crate file
             for line in Cursor::new(data).lines() {
-                let line = line.unwrap();
+                let Ok(line) = line else {
+                    continue;
+                };
                 let c = match serde_json::from_str::<CrateEntry>(&line) {
                     Ok(c) => {
                         // if vendor_path, check for matching crate name/version
@@ -219,8 +233,22 @@ pub async fn sync_crates_files(
         None,
         None,
         None,
-    )
-    .unwrap();
+    )?;
+
+    if !entry_problems.is_empty() {
+        eprintln!(
+            "warning: skipped {} index entr{} during crate diff scan:",
+            entry_problems.len(),
+            if entry_problems.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        for problem in &entry_problems {
+            eprintln!("  {problem}");
+        }
+    }
 
     pb.finish_and_clear();
     let pb = ProgressBar::new(changed_crates.len() as u64)
@@ -236,7 +264,7 @@ pub async fn sync_crates_files(
         .with_prefix(prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
 
-    let client = Client::new();
+    let client = http_client();
 
     // Dirty hack:
     // Since we can't rely on diff tree because these crates are manually set
@@ -276,7 +304,12 @@ pub async fn sync_crates_files(
         .await;
 
     for t in tasks {
-        let res = t.unwrap();
+        // A JoinError means the download task panicked; report it and move on
+        // rather than taking down the whole sync.
+        let Ok(res) = t else {
+            eprintln!("Download task failed unexpectedly");
+            continue;
+        };
         match res {
             Ok(())
             | Err(DownloadError::NotFound {
@@ -385,20 +418,21 @@ struct VendoredPackage {
 }
 
 pub(crate) fn vendor_path_to_mirror_entries(
-    mirror_entries: &mut Vec<CrateEntry>,
     vendor_path: Option<&PathBuf>,
-) {
+) -> Result<Vec<CrateEntry>, crate::mirror::MirrorError> {
+    let mut entries = vec![];
     if let Some(vendor_path) = &vendor_path {
         use walkdir::WalkDir;
         for entry in WalkDir::new(vendor_path.as_path())
             .min_depth(1)
             .max_depth(2)
         {
-            let path = entry.as_ref().unwrap().path();
+            let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
+            let path = entry.path();
             if path.file_name() == Some(OsStr::new("Cargo.toml")) {
-                let s = fs::read_to_string(entry.unwrap().path()).unwrap();
-                let crate_toml: VendoredCrate = toml::from_str(&s).unwrap();
-                mirror_entries.push(CrateEntry {
+                let s = fs::read_to_string(path)?;
+                let crate_toml: VendoredCrate = toml::from_str(&s)?;
+                entries.push(CrateEntry {
                     name: crate_toml.package.name,
                     vers: crate_toml.package.version,
                     cksum: None,
@@ -407,6 +441,7 @@ pub(crate) fn vendor_path_to_mirror_entries(
             }
         }
     }
+    Ok(entries)
 }
 
 /// Minimal view of a `Cargo.lock`.
@@ -424,33 +459,93 @@ struct CargoLockPackage {
 }
 
 pub(crate) fn cargo_lock_to_mirror_entries(
-    mirror_entries: &mut Vec<CrateEntry>,
     cargo_lock_filepath: Option<&PathBuf>,
-) {
+) -> Result<Vec<CrateEntry>, crate::mirror::MirrorError> {
+    let mut entries = vec![];
     if let Some(cargo_lock_filepath) = &cargo_lock_filepath {
         if cargo_lock_filepath.is_file() {
-            let s = fs::read_to_string(cargo_lock_filepath).unwrap();
-            let cargo_lock: CargoLock = toml::from_str(&s).unwrap();
+            let s = fs::read_to_string(cargo_lock_filepath)?;
+            let cargo_lock: CargoLock = toml::from_str(&s)?;
             if let Some(packages) = cargo_lock.package {
                 for package in packages {
                     // filter out non crates-io crates
-                    if let Some(source) = &package.source {
-                        if source.contains("registry+https://github.com/rust-lang/crates.io-index")
-                        {
-                            mirror_entries.push(CrateEntry {
-                                name: package.name,
-                                vers: package.version,
-                                // Registry packages in a valid Cargo.lock always have a
-                                // checksum; fall back to "none" like toml_edit did.
-                                cksum: Some(package.checksum.unwrap_or_else(|| "none".to_string())),
-                                yanked: None,
-                            });
-                        }
+                    if let Some(source) = &package.source
+                        && source.contains("registry+https://github.com/rust-lang/crates.io-index")
+                    {
+                        entries.push(CrateEntry {
+                            name: package.name,
+                            vers: package.version,
+                            // Registry packages in a valid Cargo.lock always have a
+                            // checksum; fall back to "none" like toml_edit did.
+                            cksum: Some(package.checksum.unwrap_or_else(|| "none".to_string())),
+                            yanked: None,
+                        });
                     }
                 }
             }
         } else {
             eprintln!("{:?} is not a Cargo.lock!", cargo_lock_filepath);
         }
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_path_one_letter() {
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "a", "1.0.0"),
+            Some(PathBuf::from("/m/crates/1/a/1.0.0/a-1.0.0.crate"))
+        );
+    }
+
+    #[test]
+    fn crate_path_two_letters() {
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "ab", "0.1.0"),
+            Some(PathBuf::from("/m/crates/2/ab/0.1.0/ab-0.1.0.crate"))
+        );
+    }
+
+    #[test]
+    fn crate_path_three_letters() {
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "abc", "2.3.4"),
+            Some(PathBuf::from("/m/crates/3/a/abc/2.3.4/abc-2.3.4.crate"))
+        );
+    }
+
+    #[test]
+    fn crate_path_four_letters() {
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "abcd", "1.2.3"),
+            Some(PathBuf::from("/m/crates/ab/cd/abcd/1.2.3/abcd-1.2.3.crate"))
+        );
+    }
+
+    #[test]
+    fn crate_path_real_world_names() {
+        // ripgrep: 7 letters -> first two + next two
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "ripgrep", "13.0.0"),
+            Some(PathBuf::from(
+                "/m/crates/ri/pg/ripgrep/13.0.0/ripgrep-13.0.0.crate"
+            ))
+        );
+        // zstd: 4 letters
+        assert_eq!(
+            get_crate_path(Path::new("/m"), "zstd", "0.14.0"),
+            Some(PathBuf::from(
+                "/m/crates/zs/td/zstd/0.14.0/zstd-0.14.0.crate"
+            ))
+        );
+    }
+
+    #[test]
+    fn crate_path_empty_name_is_none() {
+        assert_eq!(get_crate_path(Path::new("/m"), "", "1.0.0"), None);
     }
 }

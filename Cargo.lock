@@ -1229,6 +1229,7 @@ dependencies = [
  "git2",
  "glob",
  "http",
+ "httpdate",
  "hyper-util",
  "include_dir",
  "indicatif",

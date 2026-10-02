@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
 
 use askama::Template;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use futures_util::stream::unfold;
 use include_dir::{Dir, include_dir};
@@ -9,7 +9,7 @@ use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
     process::Command,
 };
 use tokio_stream::StreamExt;
@@ -148,12 +148,20 @@ fn build_routes(
     // Handle crates requests in the format of "/crates/ripgrep/0.1.0/download"
     // This format is the default for cargo, and will be used if an external process rewrites config.json in crates.io-index
     let crates_mirror_path = path.clone();
-    let crates_dir_native_format = warp::path!("crates" / String / String / "download").and_then(
-        move |name: String, version: String| {
-            let mirror_path = crates_mirror_path.clone();
-            async move { get_crate_file(mirror_path, &name, &version).await }
-        },
-    );
+    let crates_dir_native_format = warp::path!("crates" / String / String / "download")
+        .and(warp::header::optional("If-None-Match"))
+        .and(warp::header::optional("Range"))
+        .and_then(
+            move |name: String,
+                  version: String,
+                  if_none_match: Option<String>,
+                  range_header: Option<String>| {
+                let mirror_path = crates_mirror_path.clone();
+                async move {
+                    get_crate_file(mirror_path, &name, &version, if_none_match, range_header).await
+                }
+            },
+        );
 
     // Handle crates requests in the format of either :
     // - "/crates/1/u/0.2.0/u-0.2.0.crate"
@@ -192,15 +200,23 @@ fn build_routes(
         .unify()
         .or(crates_dir_condensed_format_full)
         .unify()
-        .and_then(move |name: String, version: String, crate_file: String| {
-            let mirror_path = crates_mirror_path_2.clone();
-            async move {
-                if !crate_file.ends_with(".crate") || !crate_file.starts_with(&name) {
-                    return Err(warp::reject::not_found());
+        .and(warp::header::optional("If-None-Match"))
+        .and(warp::header::optional("Range"))
+        .and_then(
+            move |name: String,
+                  version: String,
+                  crate_file: String,
+                  if_none_match: Option<String>,
+                  range_header: Option<String>| {
+                let mirror_path = crates_mirror_path_2.clone();
+                async move {
+                    if !crate_file.ends_with(".crate") || !crate_file.starts_with(&name) {
+                        return Err(warp::reject::not_found());
+                    }
+                    get_crate_file(mirror_path, &name, &version, if_none_match, range_header).await
                 }
-                get_crate_file(mirror_path, &name, &version).await
-            }
-        });
+            },
+        );
 
     // Handle git client requests to /git/crates.io-index
     let path_for_git = path.clone();
@@ -365,16 +381,106 @@ async fn get_rustup_platforms(path: PathBuf) -> io::Result<Vec<Platform>> {
     Ok(output)
 }
 
+/// A parsed `Range: bytes=...` request (single range, per the issue scope).
+enum ParseRange {
+    /// No Range header: serve the whole file.
+    Full,
+    /// Inclusive byte range to serve.
+    Partial(u64, u64),
+    /// Malformed header or a range with no overlap with the file.
+    Unsatisfiable,
+}
+
+/// Parse a single-range `Range` header against a file of `total` bytes.
+fn parse_range(header: Option<&str>, total: u64) -> ParseRange {
+    let Some(header) = header else {
+        return ParseRange::Full;
+    };
+    let Some(header) = header.trim().strip_prefix("bytes=") else {
+        return ParseRange::Unsatisfiable;
+    };
+    // Only a single range is supported (the first one if several are listed).
+    let Some(spec) = header.split(',').next() else {
+        return ParseRange::Unsatisfiable;
+    };
+    let spec = spec.trim();
+    if total == 0 {
+        return ParseRange::Unsatisfiable;
+    }
+    let (start, end) = match spec.split_once('-') {
+        Some((s, e)) => {
+            let s = s.trim();
+            let e = e.trim();
+            if s.is_empty() {
+                // Suffix range: the last N bytes ("bytes=-N").
+                let n = match e.parse::<u64>() {
+                    Ok(n) if n <= total => n,
+                    _ => return ParseRange::Unsatisfiable,
+                };
+                (total - n, total - 1)
+            } else {
+                let start = match s.parse::<u64>() {
+                    Ok(v) if v < total => v,
+                    _ => return ParseRange::Unsatisfiable,
+                };
+                // "start-" (open ended) clamps to the end of the file.
+                let end = e
+                    .parse::<u64>()
+                    .map(|v| v.min(total - 1))
+                    .unwrap_or(total - 1);
+                (start, end)
+            }
+        }
+        None => return ParseRange::Unsatisfiable,
+    };
+    ParseRange::Partial(start, end)
+}
+
+/// Stream up to `limit` bytes of `file` starting at `start` (206 responses).
+fn range_stream(
+    file: File,
+    start: u64,
+    limit: u64,
+) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
+    const CHUNK: u64 = 64 * 1024;
+    futures_util::stream::unfold(
+        (file, limit, Some(start)),
+        |(mut file, remaining, seek_pending)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            if let Some(pos) = seek_pending
+                && let Err(e) = file.seek(SeekFrom::Start(pos)).await
+            {
+                return Some((Err(e), (file, 0, None)));
+            }
+            let want = remaining.min(CHUNK);
+            let mut buf = vec![0u8; want as usize];
+            match file.read_exact(&mut buf).await {
+                Ok(_) => Some((Ok(Bytes::from(buf)), (file, remaining - want, None))),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
+                Err(e) => Some((Err(e), (file, 0, None))),
+            }
+        },
+    )
+}
+
 /// Return a crate file as an HTTP response, streamed from disk.
+///
+/// Supports `If-None-Match` (304), `Last-Modified`, a weak `ETag`, and single
+/// `Range` requests (206), so generic HTTP clients and resumable downloads
+/// work. `cargo`/`rustup` don't use these headers and are unaffected.
 async fn get_crate_file(
     mirror_path: PathBuf,
     name: &str,
     version: &str,
+    if_none_match: Option<String>,
+    range_header: Option<String>,
 ) -> Result<impl Reply + use<>, Rejection> {
-    // `use<>` (edition 2024 precise capturing): the streamed reply is fully
-    // owned (tokio File + codec), so it captures no lifetimes. Without this,
-    // the 2024 capture rules reject callers that borrow `name`/`version`
-    // from short-lived locals.
+    // `use<>` (edition 2024 precise capturing): the reply is fully owned
+    // (tokio File + codec), so it captures no lifetimes. Without this, the
+    // 2024 capture rules reject callers that borrow `name`/`version` from
+    // short-lived locals.
     let full_path =
         get_crate_path(&mirror_path, name, version).ok_or_else(warp::reject::not_found)?;
 
@@ -385,13 +491,85 @@ async fn get_crate_file(
         .metadata()
         .await
         .map_err(|_| warp::reject::not_found())?;
-    let stream = FramedRead::new(file, BytesCodec::new()).map_ok(|buf: BytesMut| buf.freeze());
+    let total = meta.len();
 
-    Ok(reply::with_header(
-        reply::stream(stream),
-        warp::http::header::CONTENT_LENGTH,
-        meta.len(),
-    ))
+    // Weak ETag derived from mtime + size: good enough for a local file store.
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let etag = format!("W/\"{}-{}\"", mtime, total);
+    let last_modified = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| httpdate::fmt_http_date(std::time::UNIX_EPOCH + d));
+
+    // 304 Not Modified?
+    if let Some(header) = if_none_match {
+        let strong = format!("\"{}-{}\"", mtime, total);
+        let matched = header
+            .split(',')
+            .map(str::trim)
+            .any(|v| v == "*" || v == etag || v == strong);
+        if matched {
+            // Same concrete type (Box<dyn Reply>) as the full/partial arms
+            // so the `impl Reply` return type unifies.
+            let r: Box<dyn Reply> = Box::new(reply::with_header(
+                // `()` doesn't implement Reply in warp 0.4; use an empty Vec.
+                reply::with_status(Vec::<u8>::new(), warp::http::StatusCode::NOT_MODIFIED),
+                "ETag",
+                etag,
+            ));
+            return Ok(r);
+        }
+    }
+
+    let reply: Box<dyn Reply> = match parse_range(range_header.as_deref(), total) {
+        ParseRange::Unsatisfiable => Box::new(reply::with_header(
+            reply::with_status(
+                Vec::<u8>::new(),
+                warp::http::StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            "Content-Range",
+            format!("bytes */{total}"),
+        )),
+        ParseRange::Partial(start, end) => {
+            let stream = range_stream(file, start, end - start + 1);
+            let r = reply::with_status(
+                reply::stream(stream),
+                warp::http::StatusCode::PARTIAL_CONTENT,
+            );
+            let r = reply::with_header(r, "Content-Range", format!("bytes {start}-{end}/{total}"));
+            let r = reply::with_header(r, "ETag", etag);
+            if let Some(lm) = last_modified {
+                let r = reply::with_header(r, "Last-Modified", lm);
+                Box::new(r)
+            } else {
+                Box::new(r)
+            }
+        }
+        ParseRange::Full => {
+            let stream =
+                FramedRead::new(file, BytesCodec::new()).map_ok(|buf: BytesMut| buf.freeze());
+            let r = reply::with_header(
+                reply::stream(stream),
+                warp::http::header::CONTENT_LENGTH,
+                total,
+            );
+            let r = reply::with_header(r, "ETag", etag);
+            if let Some(lm) = last_modified {
+                let r = reply::with_header(r, "Last-Modified", lm);
+                Box::new(r)
+            } else {
+                Box::new(r)
+            }
+        }
+    };
+
+    Ok(reply)
 }
 
 /// Handle a request from a git client by proxying to `git http-backend`.
@@ -774,5 +952,131 @@ mod tests {
             .reply(&routes(dir.path().to_path_buf()))
             .await;
         assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn crate_route_etag_and_304() {
+        let dir = tempfile::tempdir().unwrap();
+        make_test_mirror(dir.path());
+
+        // First request advertises a weak ETag and Last-Modified.
+        let resp = warp::test::request()
+            .path("/crates/ripgrep/13.0.0/download")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(http::header::ETAG)
+            .expect("ETag header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.starts_with("W/\""), "weak etag: {etag}");
+        assert!(resp.headers().get(http::header::LAST_MODIFIED).is_some());
+        let body = body_of(resp);
+        assert_eq!(body, b"fake-ripgrep-crate");
+
+        // Same ETag back -> 304 with an empty body.
+        let resp = warp::test::request()
+            .path("/crates/ripgrep/13.0.0/download")
+            .header("If-None-Match", &etag)
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::NOT_MODIFIED);
+        assert_eq!(body_of(resp), b"");
+
+        // A different ETag -> full 200 again.
+        let resp = warp::test::request()
+            .path("/crates/ripgrep/13.0.0/download")
+            .header("If-None-Match", "W/\"0-1\"")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(body_of(resp), body);
+    }
+
+    #[tokio::test]
+    async fn crate_route_range_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        make_test_mirror(dir.path());
+        const BODY: &[u8] = b"fake-ripgrep-crate"; // 18 bytes
+        let path = "/crates/ripgrep/13.0.0/download";
+
+        // Explicit range: first 5 bytes.
+        let resp = warp::test::request()
+            .path(path)
+            .header("Range", "bytes=0-4")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 0-4/18"
+        );
+        assert_eq!(body_of(resp), &BODY[0..5]);
+
+        // Open-ended: from byte 5 to the end.
+        let resp = warp::test::request()
+            .path(path)
+            .header("Range", "bytes=5-")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_of(resp), &BODY[5..]);
+
+        // Suffix range: last 4 bytes.
+        let resp = warp::test::request()
+            .path(path)
+            .header("Range", "bytes=-4")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_of(resp), &BODY[14..]);
+
+        // Range beyond EOF -> 416 with Content-Range: bytes */total.
+        let resp = warp::test::request()
+            .path(path)
+            .header("Range", "bytes=999-")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */18"
+        );
+
+        // Condensed format gets the same treatment.
+        let resp = warp::test::request()
+            .path("/crates/ri/pg/ripgrep/13.0.0/ripgrep-13.0.0.crate")
+            .header("Range", "bytes=0-3")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_of(resp), &BODY[0..4]);
+    }
+
+    #[tokio::test]
+    async fn dist_route_range_requests() {
+        // /dist is served by warp::fs, which implements Range natively.
+        let dir = tempfile::tempdir().unwrap();
+        make_test_mirror(dir.path());
+
+        let resp = warp::test::request()
+            .path("/dist/test-tool/toolchain")
+            .header("Range", "bytes=0-3")
+            .reply(&routes(dir.path().to_path_buf()))
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+        // bytes=0-3 is inclusive: 4 bytes.
+        assert_eq!(body_of(resp), b"fake");
     }
 }

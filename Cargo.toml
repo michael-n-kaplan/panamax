@@ -41,6 +41,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 walkdir = "2.3"
 toml = "1"
+httpdate = "1"
 
 [dev-dependencies]
 tempfile = "3"

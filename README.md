@@ -17,23 +17,7 @@ $ cargo install --locked panamax
 
 Alternatively, you can clone this repository and `cargo build` or `cargo run` within it.
 
-## Usage
-
-## Docker
-
-Panamax is available as a docker image, so you can run:
-
-```
-$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax init /mirror
-(Modify /path/to/mirror/mirror.toml as needed)
-$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax sync /mirror
-(Once synced, serve the mirror)
-$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) -p8080:8080 panamaxrs/panamax serve /mirror
-```
-
-Alternatively, you can run panamax in a bare-metal environment like below.
-
-### Init
+## Init
 
 In Panamax, mirrors consist of self-contained directories. To create a mirror directory `my-mirror`:
 
@@ -45,7 +29,7 @@ Make any desired changes to my-mirror/mirror.toml, then run panamax sync my-mirr
 
 There will now be a `my-mirror` directory in your current directory.
 
-### Modify mirror.toml
+## Modify mirror.toml
 
 Within the directory, you'll find a `mirror.toml` file. This file contains the full configuration of the mirror, and while it has sane defaults, you should ensure the values are set to what you want.
 
@@ -53,7 +37,7 @@ The other important parameter to set is the `base_url` within the `[crates]` sec
 
 You can modify `mirror.toml` at any point in time, even after the mirror is synchronized.
 
-### Sync
+## Sync
 
 Once you have made the changes to `mirror.toml`, it is time to synchronize your mirror!
 
@@ -67,20 +51,21 @@ Syncing Rustup repositories...
 [5/5] Cleaning old files...        ████████████████████████████████████████████████████████████ 546/546 [00:00:00]
 Syncing Rustup repositories complete!
 Syncing Crates repositories...
-[1/3] Fetching crates.io-index...  ██████████████████████████████████████████████████████████ 1615/1615 [00:00:02]
-[2/3] Syncing crates files...      ██████████████████████████████████████████████████████████ 6357/6357 [00:00:05]
+[1/3] Fetching crates.io-index...  ██████████████████████████████████████████████████████████████ 1615/1615 [00:00:02]
+[2/3] Syncing crates files...      ██████████████████████████████████████████████████████████████ 6357/6357 [00:00:05]
 [3/3] Syncing index and config...
 Syncing Crates repositories complete!
 Sync complete.
 ```
 
-Once this is step completes (without download errors), you will now have a full, synchronized copy of all the files needed to use `rustup` and `cargo` to their full potential!
+Once this step completes (without download errors), you will now have a full, synchronized copy of all the files needed to use `rustup` and `cargo` to their full potential!
 
 This directory can now be copied to a USB or rsync'd somewhere else, or even used in place - perfect for long plane trips!
 
-Additionally, this mirror can continually by synchronized in the future - one recommendation is to run this command in a cronjob once each night, to keep the mirror reasonably up to date.
+Additionally, this mirror can continually be synchronized in the future - one recommendation is to run this command in a cronjob once each night, to keep the mirror reasonably up to date.
 
-### Sync Select Dependencies
+## Sync Select Dependencies
+
 Optionally, panamax can be told to only grab crates needed to build a singular project.
 `cargo vendor` is used to create a folder with all needed dependencies,
 then a panamax command can parse the created directory and only grab those crates and versions.
@@ -112,6 +97,18 @@ The served crates.io index is a **git repository**, and panamax exposes `git htt
 - On a **trusted internal network** this is usually acceptable, and panamax prints a warning at startup when serving over plain HTTP.
 - If the mirror is **internet-facing**, serve the index over TLS (`--cert-path`/`--key-path`). Clients only need **read** access to the git endpoint (`git clone`/`fetch`); push is not required for normal use, but `git http-backend` cannot distinguish the two, so restrict the endpoint (reverse proxy with auth, firewall rules) if untrusted clients may reach it.
 - Plain HTTP (`http://`) exposes both downloads and the unauthenticated push endpoint to the network; prefer TLS for any non-local deployment.
+
+## Docker
+
+Panamax is also available as a Docker image, so you can run the same workflow in a container. The examples below are pinned to the `1.0.14` release tag - substitute the tag of the release you want:
+
+```
+$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax:1.0.14 init /mirror
+(Modify /path/to/mirror/mirror.toml as needed)
+$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) panamaxrs/panamax:1.0.14 sync /mirror
+(Once synced, serve the mirror)
+$ docker run --rm -it -v /path/to/mirror/:/mirror --user $(id -u) -p8080:8080 panamaxrs/panamax:1.0.14 serve /mirror
+```
 
 ## Configuring `rustup` and `cargo`
 
@@ -165,8 +162,7 @@ $ cargo install ripgrep
 
 This will install the grep-like `rg` tool (which is a great tool - props to burntsushi!). If `cargo` successfully downloads and builds everything, you have yourself a working mirror. Congratulations!
 
-
-### Proxies
+## Proxies
 
 If you need to run Panamax through a proxy, you will need to set your configuration options in two places.
 
@@ -187,7 +183,7 @@ Licensed under the terms of the MIT license and the Apache License (Version 2.0)
 
 See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) for details.
 
-### Contribution
+## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any

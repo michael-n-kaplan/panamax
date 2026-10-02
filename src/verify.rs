@@ -9,11 +9,11 @@ use std::{
 };
 
 use console::style;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use git2::Repository;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
 use reqwest::Client;
-use warp::http::HeaderValue;
+use http::header::HeaderValue;
 
 use crate::{
     crates::{
@@ -369,7 +369,7 @@ pub(crate) async fn fix_mirror(
 
     // This code is copied from `crates::sync_crates_files` and could be mutualised in a future commit.
     // For example in a function within module crates (e.g. `crates::build_and_run_tasks`)
-    let tasks = futures::stream::iter(crates_to_fetch.into_iter())
+    let tasks = futures_util::stream::iter(crates_to_fetch.into_iter())
         .map(|c| {
             // Duplicate variables used in the async closure.
             let client = client.clone();

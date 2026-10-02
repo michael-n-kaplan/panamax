@@ -6,7 +6,7 @@ use crate::download::{
 use crate::mirror::{ConfigMirror, ConfigRustup, MirrorError};
 use crate::progress_bar::{current_step_prefix, padded_prefix_message};
 use console::style;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
 use reqwest::header::HeaderValue;
 use reqwest::Client;
@@ -221,7 +221,7 @@ async fn create_sync_tasks(
     pb: &ProgressBar,
 ) -> Vec<Result<Result<(), DownloadError>, JoinError>> {
     let client = Client::new();
-    futures::stream::iter(platforms.iter())
+    futures_util::stream::iter(platforms.iter())
         .map(|platform| {
             let client = client.clone();
             let rustup_version = rustup_version.to_string();
@@ -627,7 +627,7 @@ pub async fn sync_rustup_channel(
 
     let mut errors_occurred = 0usize;
 
-    let tasks = futures::stream::iter(files.iter())
+    let tasks = futures_util::stream::iter(files.iter())
         .map(|(url, hash)| {
             // Clone the variables that will be moved into the tokio task.
             let client = client.clone();

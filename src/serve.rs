@@ -1,24 +1,32 @@
-use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf, process::Stdio};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+};
 
 use askama::Template;
 use bytes::BytesMut;
-use futures_util::stream::TryStreamExt;
+use futures_util::stream::unfold;
+use futures_util::TryStreamExt;
 use include_dir::{include_dir, Dir};
+use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdout, Command},
+    process::Command,
 };
 use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use warp::{
     host::Authority,
-    http,
-    hyper::{body::Sender, Body, Response},
     path::Tail,
     reject::Reject,
-    Filter, Rejection, Stream,
+    reply::{self, Reply},
+    Filter, Rejection,
 };
 
 use crate::crates::get_crate_path;
@@ -51,6 +59,10 @@ pub enum ServeError {
     Hyper(#[from] warp::hyper::Error),
     #[error("Warp HTTP error: {0}")]
     Warp(#[from] warp::http::Error),
+    #[error("TLS error: {0}")]
+    Tls(#[from] rustls::Error),
+    #[error("PEM error: {0}")]
+    Pem(#[from] rustls::pki_types::pem::Error),
     #[error("{0}")]
     Other(String),
 }
@@ -58,8 +70,30 @@ pub enum ServeError {
 impl Reject for ServeError {}
 
 pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<TlsConfig>) {
-    let index_path = path.clone();
     let is_tls = tls_paths.is_some();
+    let routes = build_routes(path, is_tls);
+
+    match tls_paths {
+        Some(TlsConfig {
+            cert_path,
+            key_path,
+        }) => {
+            println!("Running TLS on {socket_addr}");
+            serve_tls(routes, socket_addr, &cert_path, &key_path).await;
+        }
+        None => {
+            println!("Running HTTP on {socket_addr}");
+            warp::serve(routes).run(socket_addr).await;
+        }
+    }
+}
+
+/// Build all of the mirror's routes.
+fn build_routes(
+    path: PathBuf,
+    is_tls: bool,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone + Send + Sync {
+    let index_path = path.clone();
 
     // Handle the homepage
     let index = warp::path::end().and(warp::host::optional()).and_then(
@@ -67,19 +101,25 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
             let mirror_path = index_path.clone();
             let protocol = if is_tls { "https://" } else { "http://" };
             async move {
-                get_rustup_platforms(mirror_path)
+                let platforms = get_rustup_platforms(mirror_path)
                     .await
-                    .map(|platforms| IndexTemplate {
-                        platforms,
-                        host: authority
-                            .map(|a| format!("{}{}", protocol, a.as_str()))
-                            .unwrap_or_else(|| "http://panamax.internal".to_string()),
-                    })
                     .map_err(|_| {
                         warp::reject::custom(ServeError::Other(
                             "Could not retrieve rustup platforms.".to_string(),
                         ))
-                    })
+                    })?;
+                let template = IndexTemplate {
+                    platforms,
+                    host: authority
+                        .map(|a| format!("{}{}", protocol, a.as_str()))
+                        .unwrap_or_else(|| "http://panamax.internal".to_string()),
+                };
+                let html = template.render().map_err(|e| {
+                    warp::reject::custom(ServeError::Other(format!(
+                        "Failed to render index: {e}"
+                    )))
+                })?;
+                Ok(reply::html(html)) as Result<reply::Html<String>, Rejection>
             }
         },
     );
@@ -111,7 +151,7 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     // Handle crates requests in the format of either :
     // - "/crates/1/u/0.2.0/u-0.2.0.crate"
     // - "/crates/2/bm/0.11.0/bm-0.11.0.crate"
-    // - "/crates/3/c/cde/0.1.1/cde-0.1.1.crate"
+    // - "/crates/3/c/cde/0.1.1/cde-0.11.0.crate"
     // - "/crates/se/rd/serde/1.0.130/serde-1.0.130.crate"
     // This format is used by Panamax, and/or is used if config.json contains "/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate"
     let crates_mirror_path_2 = path.clone();
@@ -186,33 +226,102 @@ pub async fn serve(path: PathBuf, socket_addr: SocketAddr, tls_paths: Option<Tls
     // Handle sparse index requests at /index/
     let sparse_index = warp::path("index").and(warp::fs::dir(path.join("crates.io-index")));
 
-    let routes = index
+    index
         .or(static_dir)
         .or(dist_dir)
         .or(rustup_dir)
         .or(crates_dir_native_format)
         .or(crates_dir_condensed_format)
         .or(sparse_index)
-        .or(git);
+        .or(git)
+}
 
-    match tls_paths {
-        Some(TlsConfig {
-            cert_path,
-            key_path,
-        }) => {
-            println!("Running TLS on {socket_addr}");
-            warp::serve(routes)
-                .tls()
-                .cert_path(cert_path)
-                .key_path(key_path)
-                .run(socket_addr)
-                .await;
+/// Serve the routes over TLS, using rustls via hyper-util.
+///
+/// warp 0.4 no longer ships a built-in TLS server (warp 0.3's
+/// `.tls().cert_path().key_path()` is gone), so we combine the warp filter
+/// service with hyper's HTTP/1 server over a rustls acceptor.
+async fn serve_tls(
+    routes: impl Filter<Extract = impl Reply, Error = Rejection> + Clone + Send + Sync + 'static,
+    addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) {
+    let config = match load_tls_config(cert_path, key_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to load TLS configuration: {e}");
+            return;
         }
-        None => {
-            println!("Running HTTP on {socket_addr}");
-            warp::serve(routes).run(socket_addr).await;
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+
+    let hyper_service = hyper_util::service::TowerToHyperService::new(warp::service(routes));
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Failed to bind {addr}: {e}");
+            return;
         }
+    };
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("Failed to accept connection: {e}");
+                continue;
+            }
+        };
+        let service = hyper_service.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!("TLS handshake failed for {peer}: {e}");
+                    return;
+                }
+            };
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .http1_only()
+            .serve_connection(io, service)
+            .await
+            {
+                eprintln!("Error serving connection for {peer}: {e}");
+            }
+        });
     }
+}
+
+/// Load certificate + key files into a rustls ServerConfig.
+fn load_tls_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<Arc<rustls::ServerConfig>, ServeError> {
+    // Install the default crypto provider (aws-lc-rs) for rustls 0.23.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_file_iter(cert_path)?
+            .collect::<Result<Vec<_>, _>>()?;
+    if cert_chain.is_empty() {
+        return Err(ServeError::Other(
+            "No certificates found in certificate file".to_string(),
+        ));
+    }
+
+    let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path)?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key_der)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
 }
 
 /// Get all rustup platforms available on the mirror.
@@ -250,12 +359,12 @@ async fn get_rustup_platforms(path: PathBuf) -> io::Result<Vec<Platform>> {
     Ok(output)
 }
 
-/// Return a crate file as an HTTP response.
+/// Return a crate file as an HTTP response, streamed from disk.
 async fn get_crate_file(
     mirror_path: PathBuf,
     name: &str,
     version: &str,
-) -> Result<Response<Body>, Rejection> {
+) -> Result<impl Reply, Rejection> {
     let full_path =
         get_crate_path(&mirror_path, name, version).ok_or_else(warp::reject::not_found)?;
 
@@ -266,30 +375,28 @@ async fn get_crate_file(
         .metadata()
         .await
         .map_err(|_| warp::reject::not_found())?;
-    let stream = FramedRead::new(file, BytesCodec::new()).map_ok(BytesMut::freeze);
+    let stream = FramedRead::new(file, BytesCodec::new()).map_ok(|buf: BytesMut| buf.freeze());
 
-    let body = Body::wrap_stream(stream);
-
-    let mut resp = Response::new(body);
-    resp.headers_mut()
-        .insert(http::header::CONTENT_LENGTH, meta.len().into());
-
-    Ok(resp)
+    Ok(reply::with_header(
+        reply::stream(stream),
+        warp::http::header::CONTENT_LENGTH,
+        meta.len(),
+    ))
 }
 
-/// Handle a request from a git client.
+/// Handle a request from a git client by proxying to `git http-backend`.
 async fn handle_git<S, B>(
     mirror_path: PathBuf,
     path_tail: Tail,
-    method: http::Method,
+    method: warp::http::Method,
     content_type: Option<String>,
     remote: Option<SocketAddr>,
     mut body: S,
     query: String,
-) -> Result<Response<Body>, Rejection>
+) -> Result<impl Reply, Rejection>
 where
-    S: Stream<Item = Result<B, warp::Error>> + Send + Unpin + 'static,
-    B: bytes::Buf + Sized,
+    S: StreamExt<Item = Result<B, warp::Error>> + Send + Unpin + 'static,
+    B: bytes::Buf + Send + 'static,
 {
     let remote = remote
         .map(|r| r.ip().to_string())
@@ -319,20 +426,23 @@ where
     cmd.stdout(Stdio::piped());
     cmd.stdin(Stdio::piped());
 
-    let p = cmd.spawn().map_err(ServeError::from)?;
+    let mut p = cmd.spawn().map_err(ServeError::from)?;
 
     // Handle sending git client body to http-backend, if any
-    let mut git_input = p.stdin.expect("Process should always have stdin");
+    let mut git_input = p.stdin.take().expect("Process should always have stdin");
     while let Some(Ok(mut buf)) = body.next().await {
         git_input
             .write_all_buf(&mut buf)
             .await
             .map_err(ServeError::from)?;
     }
+    // Signal EOF to git http-backend so it knows the request body is complete.
+    let _ = git_input.shutdown().await;
 
     // Collect headers from git CGI output
-    let mut git_output = BufReader::new(p.stdout.expect("Process should always have stdout"));
+    let mut git_output = BufReader::new(p.stdout.take().expect("Process should always have stdout"));
     let mut headers = HashMap::new();
+    let mut status: Option<u16> = None;
     loop {
         let mut line = String::new();
         git_output
@@ -346,41 +456,40 @@ where
         }
 
         if let Some((key, value)) = line.split_once(": ") {
-            headers.insert(key.to_string(), value.to_string());
+            if key.eq_ignore_ascii_case("Status") {
+                // The Status line is of the form "200 OK"; keep just the code.
+                status = value.get(..3).and_then(|s| s.parse().ok());
+            } else {
+                headers.insert(key.to_string(), value.to_string());
+            }
         }
     }
 
-    // Add headers to response (except for Status, which is the "200 OK" line)
-    let mut resp = Response::builder();
-    for (key, val) in headers {
-        if key == "Status" {
-            resp = resp.status(&val.as_bytes()[..3]);
-        } else {
-            resp = resp.header(&key, val);
-        }
-    }
-
-    // Create channel, so data can be streamed without being fully loaded
-    // into memory. Requires a separate future to be spawned.
-    let (sender, body) = Body::channel();
-    tokio::spawn(send_git(sender, git_output));
-
-    let resp = resp.body(body).map_err(ServeError::from)?;
-    Ok(resp)
-}
-
-/// Send data from git CGI process to hyper Sender, until there is no more
-/// data left.
-async fn send_git(
-    mut sender: Sender,
-    mut git_output: BufReader<ChildStdout>,
-) -> Result<(), ServeError> {
-    loop {
+    // Stream the git CGI response body without buffering it fully in memory.
+    let stream = unfold(git_output, |mut output| async move {
         let mut bytes_out = BytesMut::new();
-        git_output.read_buf(&mut bytes_out).await?;
-        if bytes_out.is_empty() {
-            return Ok(());
+        match output.read_buf(&mut bytes_out).await {
+            Ok(_) if bytes_out.is_empty() => None,
+            Ok(_) => Some((Ok(bytes_out.freeze()), output)),
+            Err(e) => Some((Err(e), output)),
         }
-        sender.send_data(bytes_out.freeze()).await?;
+    });
+
+    // Wrap the streamed body with the CGI-provided status and headers.
+    let mut reply: Box<dyn Reply> = Box::new(reply::stream(stream));
+    for (key, value) in headers {
+        if let (Ok(name), Ok(val)) = (
+            warp::http::HeaderName::from_bytes(key.as_bytes()),
+            value.parse::<warp::http::HeaderValue>(),
+        ) {
+            reply = Box::new(reply::with_header(reply, name, val));
+        }
     }
+    if let Some(status) = status {
+        if let Ok(status) = warp::http::StatusCode::from_u16(status) {
+            reply = Box::new(reply::with_status(reply, status));
+        }
+    }
+
+    Ok(reply)
 }

@@ -2,7 +2,7 @@ use crate::crates_index::{fast_forward, IndexSyncError};
 use crate::download::{download, DownloadError};
 use crate::mirror::{ConfigCrates, ConfigMirror};
 use crate::progress_bar::padded_prefix_message;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use git2::Repository;
 use indicatif::{ProgressBar, ProgressFinish, ProgressStyle};
 use reqwest::header::HeaderValue;
@@ -245,7 +245,7 @@ pub async fn sync_crates_files(
         changed_crates.append(&mut mirror_entries);
     }
 
-    let tasks = futures::stream::iter(changed_crates.into_iter())
+    let tasks = futures_util::stream::iter(changed_crates.into_iter())
         .map(|c| {
             let client = client.clone();
             // Duplicate variables used in the async closure.

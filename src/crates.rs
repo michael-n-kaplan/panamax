@@ -245,7 +245,7 @@ pub async fn sync_crates_files(
         changed_crates.append(&mut mirror_entries);
     }
 
-    let tasks = futures_util::stream::iter(changed_crates.into_iter())
+    let tasks = futures_util::stream::iter(changed_crates)
         .map(|c| {
             let client = client.clone();
             // Duplicate variables used in the async closure.
@@ -372,6 +372,18 @@ pub fn get_crate_path(
     )
 }
 
+/// Minimal view of a vendored crate's `Cargo.toml`.
+#[derive(Deserialize)]
+struct VendoredCrate {
+    package: VendoredPackage,
+}
+
+#[derive(Deserialize)]
+struct VendoredPackage {
+    name: String,
+    version: String,
+}
+
 pub(crate) fn vendor_path_to_mirror_entries(
     mirror_entries: &mut Vec<CrateEntry>,
     vendor_path: Option<&PathBuf>,
@@ -385,20 +397,30 @@ pub(crate) fn vendor_path_to_mirror_entries(
             let path = entry.as_ref().unwrap().path();
             if path.file_name() == Some(OsStr::new("Cargo.toml")) {
                 let s = fs::read_to_string(entry.unwrap().path()).unwrap();
-                let crate_toml = s.parse::<toml_edit::easy::Value>().unwrap();
-                if let toml_edit::easy::Value::Table(crate_f) = crate_toml {
-                    let name = crate_f["package"]["name"].to_string().replace('\"', "");
-                    let version = crate_f["package"]["version"].to_string().replace('\"', "");
-                    mirror_entries.push(CrateEntry {
-                        name,
-                        vers: version,
-                        cksum: None,
-                        yanked: None,
-                    });
-                }
+                let crate_toml: VendoredCrate = toml::from_str(&s).unwrap();
+                mirror_entries.push(CrateEntry {
+                    name: crate_toml.package.name,
+                    vers: crate_toml.package.version,
+                    cksum: None,
+                    yanked: None,
+                });
             }
         }
     }
+}
+
+/// Minimal view of a `Cargo.lock`.
+#[derive(Deserialize)]
+struct CargoLock {
+    package: Option<Vec<CargoLockPackage>>,
+}
+
+#[derive(Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
 }
 
 pub(crate) fn cargo_lock_to_mirror_entries(
@@ -408,33 +430,23 @@ pub(crate) fn cargo_lock_to_mirror_entries(
     if let Some(cargo_lock_filepath) = &cargo_lock_filepath {
         if cargo_lock_filepath.is_file() {
             let s = fs::read_to_string(cargo_lock_filepath).unwrap();
-            let cargo_lock = s.parse::<toml_edit::easy::Value>().unwrap();
-            if let toml_edit::easy::Value::Table(global) = cargo_lock {
-                let packages_array = &global["package"];
-
-                if let toml_edit::easy::Value::Array(packages) = packages_array {
-                    packages.iter().for_each(|package| {
-                        if let toml_edit::easy::Value::Table(package) = package {
-                            // filter out non crates-io crates
-                            if let Some(source) = package.get("source") {
-                                let source = source.to_string().replace('\"', "");
-                                if source.contains(
-                                    "registry+https://github.com/rust-lang/crates.io-index",
-                                ) {
-                                    let name = package["name"].to_string().replace('\"', "");
-                                    let version = package["version"].to_string().replace('\"', "");
-                                    let checksum =
-                                        package["checksum"].to_string().replace('\"', "");
-                                    mirror_entries.push(CrateEntry {
-                                        name,
-                                        vers: version,
-                                        cksum: Some(checksum),
-                                        yanked: None,
-                                    });
-                                }
-                            }
+            let cargo_lock: CargoLock = toml::from_str(&s).unwrap();
+            if let Some(packages) = cargo_lock.package {
+                for package in packages {
+                    // filter out non crates-io crates
+                    if let Some(source) = &package.source {
+                        if source.contains("registry+https://github.com/rust-lang/crates.io-index")
+                        {
+                            mirror_entries.push(CrateEntry {
+                                name: package.name,
+                                vers: package.version,
+                                // Registry packages in a valid Cargo.lock always have a
+                                // checksum; fall back to "none" like toml_edit did.
+                                cksum: Some(package.checksum.unwrap_or_else(|| "none".to_string())),
+                                yanked: None,
+                            });
                         }
-                    });
+                    }
                 }
             }
         } else {

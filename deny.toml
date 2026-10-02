@@ -1,0 +1,34 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/)
+
+[advisories]
+# cargo-deny (>= 0.19) denies all advisories — vulnerabilities, unsound,
+# unmaintained, and yanked — by default. Relax a specific advisory here
+# with a justification if ever needed.
+ignore = [
+    # { id = "RUSTSEC-0000-0000", reason = "..." },
+    # { crate = "a-yanked-crate@0.1.0", reason = "..." },
+]
+
+[licenses]
+# panamax is dual-licensed MIT/Apache-2.0. Allow the permissive licenses
+# present in the dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "ISC",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "MIT-0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+# Only allow crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

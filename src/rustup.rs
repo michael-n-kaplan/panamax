@@ -39,10 +39,10 @@ pub enum SyncError {
     Download(#[from] DownloadError),
 
     #[error("TOML deserialization error: {0}")]
-    Parse(#[from] toml_edit::de::Error),
+    Parse(#[from] toml::de::Error),
 
     #[error("TOML serialization error: {0}")]
-    Serialize(#[from] toml_edit::ser::Error),
+    Serialize(#[from] toml::ser::Error),
 
     #[error("Path prefix strip error: {0}")]
     StripPrefix(#[from] std::path::StripPrefixError),
@@ -61,6 +61,8 @@ pub struct TargetUrls {
 
 #[derive(Deserialize, Debug)]
 pub struct Target {
+    // Part of rustup's channel manifest wire format; not read directly.
+    #[allow(dead_code)]
     pub available: bool,
 
     #[serde(flatten)]
@@ -69,12 +71,16 @@ pub struct Target {
 
 #[derive(Deserialize, Debug)]
 pub struct Pkg {
+    // Part of rustup's channel manifest wire format; not read directly.
+    #[allow(dead_code)]
     pub version: String,
     pub target: HashMap<String, Target>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct Channel {
+    // Part of rustup's channel manifest wire format; not read directly.
+    #[allow(dead_code)]
     #[serde(alias = "manifest-version")]
     pub manifest_version: String,
     pub date: String,
@@ -115,7 +121,7 @@ pub async fn download_platform_list(
     let user_agent = HeaderValue::from_str(&format!("Panamax/{}", env!("CARGO_PKG_VERSION")))
         .expect("Hardcoded user agent string should never fail.");
     let channel_str = download_string(&channel_url, &user_agent).await?;
-    let channel_data: Channel = toml_edit::easy::from_str(&channel_str)?;
+    let channel_data: Channel = toml::from_str(&channel_str)?;
 
     let mut targets = HashSet::new();
 
@@ -350,7 +356,7 @@ pub fn rustup_download_list(
     platforms: &Platforms,
 ) -> Result<(String, Vec<(String, String)>), SyncError> {
     let channel_str = fs::read_to_string(path).map_err(DownloadError::Io)?;
-    let channel: Channel = toml_edit::easy::from_str(&channel_str)?;
+    let channel: Channel = toml::from_str(&channel_str)?;
 
     Ok((
         channel.date,
@@ -532,7 +538,7 @@ pub fn clean_old_files(
 pub fn get_channel_history(path: &Path, channel: &str) -> Result<ChannelHistoryFile, SyncError> {
     let channel_history_path = path.join(format!("mirror-{channel}-history.toml"));
     let ch_data = fs::read_to_string(channel_history_path)?;
-    Ok(toml_edit::easy::from_str(&ch_data)?)
+    Ok(toml::from_str(&ch_data)?)
 }
 
 pub fn add_to_channel_history(
@@ -557,7 +563,7 @@ pub fn add_to_channel_history(
 
     channel_history.versions.insert(date.to_string(), files);
 
-    let ch_data = toml_edit::ser::to_string(&channel_history)?;
+    let ch_data = toml::to_string(&channel_history)?;
 
     let channel_history_path = path.join(format!("mirror-{channel}-history.toml"));
     write_file_create_dir(&channel_history_path, &ch_data)?;
@@ -567,7 +573,7 @@ pub fn add_to_channel_history(
 
 /// Get the current rustup version from release-stable.toml.
 pub fn get_rustup_version(path: &Path) -> Result<String, SyncError> {
-    let release_data: Release = toml_edit::easy::from_str(&fs::read_to_string(path)?)?;
+    let release_data: Release = toml::from_str(&fs::read_to_string(path)?)?;
     Ok(release_data.version)
 }
 

@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    path::PathBuf,
-    process::Stdio,
-    sync::Arc,
-};
+use std::{collections::HashMap, io, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc};
 
 use askama::Template;
 use bytes::BytesMut;
@@ -101,13 +94,11 @@ fn build_routes(
             let mirror_path = index_path.clone();
             let protocol = if is_tls { "https://" } else { "http://" };
             async move {
-                let platforms = get_rustup_platforms(mirror_path)
-                    .await
-                    .map_err(|_| {
-                        warp::reject::custom(ServeError::Other(
-                            "Could not retrieve rustup platforms.".to_string(),
-                        ))
-                    })?;
+                let platforms = get_rustup_platforms(mirror_path).await.map_err(|_| {
+                    warp::reject::custom(ServeError::Other(
+                        "Could not retrieve rustup platforms.".to_string(),
+                    ))
+                })?;
                 let template = IndexTemplate {
                     platforms,
                     host: authority
@@ -115,9 +106,7 @@ fn build_routes(
                         .unwrap_or_else(|| "http://panamax.internal".to_string()),
                 };
                 let html = template.render().map_err(|e| {
-                    warp::reject::custom(ServeError::Other(format!(
-                        "Failed to render index: {e}"
-                    )))
+                    warp::reject::custom(ServeError::Other(format!("Failed to render index: {e}")))
                 })?;
                 Ok(reply::html(html)) as Result<reply::Html<String>, Rejection>
             }
@@ -285,12 +274,11 @@ async fn serve_tls(
                 }
             };
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .http1_only()
-            .serve_connection(io, service)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .http1_only()
+                    .serve_connection(io, service)
+                    .await
             {
                 eprintln!("Error serving connection for {peer}: {e}");
             }
@@ -440,7 +428,8 @@ where
     let _ = git_input.shutdown().await;
 
     // Collect headers from git CGI output
-    let mut git_output = BufReader::new(p.stdout.take().expect("Process should always have stdout"));
+    let mut git_output =
+        BufReader::new(p.stdout.take().expect("Process should always have stdout"));
     let mut headers = HashMap::new();
     let mut status: Option<u16> = None;
     loop {

@@ -23,7 +23,7 @@ pub enum MirrorError {
     Git(#[from] git2::Error),
 
     #[error("TOML deserialization error: {0:?}")]
-    Parse(#[from] toml_edit::de::Error),
+    Parse(#[from] toml::de::Error),
 
     #[error("Config file error: {0}")]
     Config(String),
@@ -35,7 +35,7 @@ pub enum MirrorError {
     DownloadError(#[from] crate::download::DownloadError),
 
     #[error("Toml error: {0}")]
-    Serialize(#[from] toml_edit::TomlError),
+    Serialize(#[from] toml::ser::Error),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -95,25 +95,58 @@ pub fn create_mirror_toml(path: &Path, ignore_rustup: bool) -> Result<bool, Mirr
         return Ok(false);
     }
 
-    // Read the defautlt toml, edit if required, using toml_edit to keep format
-    let config = include_str!("mirror.default.toml");
-    let mut config = config.parse::<toml_edit::Document>()?;
-
-    if ignore_rustup {
-        config["rustup"]["sync"] = toml_edit::value(false);
-    }
-
+    // The default template is our own file, full of explanatory comments,
+    // so copy it verbatim (a parse/serialize round-trip would drop them)
+    // and only flip `sync` in the `[rustup]` section when needed.
     let path = path.join("mirror.toml");
-    let bytes = config.to_string();
-    fs::write(path, bytes)?;
+    fs::write(path, render_mirror_config(ignore_rustup))?;
 
     Ok(true)
 }
 
+/// Render the default `mirror.toml` contents from the bundled template.
+fn render_mirror_config(ignore_rustup: bool) -> String {
+    let mut in_rustup = false;
+    let mut out = String::new();
+    for line in include_str!("mirror.default.toml").lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_rustup = trimmed == "[rustup]";
+        }
+        if ignore_rustup && in_rustup && trimmed == "sync = true" {
+            out.push_str("sync = false\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub fn load_mirror_toml(path: &Path) -> Result<Config, MirrorError> {
-    Ok(toml_edit::easy::from_str(&fs::read_to_string(
+    Ok(toml::from_str(&fs::read_to_string(
         path.join("mirror.toml"),
     )?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_round_trips() {
+        let config: Config = toml::from_str(&render_mirror_config(false)).unwrap();
+        assert!(config.rustup.as_ref().unwrap().sync);
+        assert!(config.crates.as_ref().unwrap().sync);
+    }
+
+    #[test]
+    fn ignore_rustup_disables_rustup_sync_only() {
+        let config: Config = toml::from_str(&render_mirror_config(true)).unwrap();
+        assert!(!config.rustup.as_ref().unwrap().sync);
+        // crates mirroring stays enabled
+        assert!(config.crates.as_ref().unwrap().sync);
+    }
 }
 
 pub fn init(path: &Path, ignore_rustup: bool) -> Result<(), MirrorError> {
@@ -379,7 +412,7 @@ pub(crate) async fn verify(
 
     // Getting crates.sync config state
     let crates_config = config.crates.as_ref();
-    let sync = crates_config.map_or(false, |crate_config| crate_config.sync);
+    let sync = crates_config.is_some_and(|crate_config| crate_config.sync);
 
     // Determining number of steps
     let steps = if dry_run || !sync { 1 } else { 2 };

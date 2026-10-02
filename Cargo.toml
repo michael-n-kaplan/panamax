@@ -36,7 +36,7 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = "0.3"
 walkdir = "2.3"
-toml_edit = {version = "0.14", features = ["easy"] }
+toml = "1"
 
 [features]
 default = []
